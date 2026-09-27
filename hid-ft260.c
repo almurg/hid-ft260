@@ -486,6 +486,8 @@ struct ft260_device {
 	struct gpio_chip *gc;
 	struct ft260_gpio_state gpio;
 	u16 gpio_uart_mode[FT260_GPIO_UART_MODES];
+	/* True once the gpiochip has been added via gpiochip_add_data(). */
+	bool gpio_registered;
 };
 
 static int ft260_hid_feature_report_get(struct hid_device *hdev,
@@ -1412,9 +1414,12 @@ static int ft260_gpio_init(struct ft260_device *dev,
 	(void)ft260_hid_feature_report_get(dev->hdev, FT260_CHIP_VERSION,
 					(u8 *)&ver, sizeof(ver));
 
-	ret = devm_gpiochip_add_data(&hdev->dev, dev->gc, dev);
-	if (ret < 0)
+	ret = gpiochip_add_data(dev->gc, dev);
+	if (ret < 0) {
 		hid_err(hdev, "cannot add GPIO chip %d\n", ret);
+	} else {
+		dev->gpio_registered = true;
+	}
 exit:
 	return ret;
 }
@@ -2320,6 +2325,8 @@ static int ft260_i2c_probe(struct ft260_device *dev,
 	return 0;
 
 err_i2c_free:
+	if (dev->gpio_registered)
+		gpiochip_remove(dev->gc);
 	i2c_del_adapter(&dev->adap);
 	return ret;
 }
@@ -2392,6 +2399,8 @@ static int ft260_uart_probe(struct ft260_device *dev,
 	return 0;
 
 err_hid_report:
+	if (dev->gpio_registered)
+		gpiochip_remove(dev->gc);
 	tty_port_unregister_device(&dev->port, ft260_tty_driver, dev->index);
 err_register_tty:
 	ft260_uart_port_remove(dev);
@@ -2709,6 +2718,8 @@ static void ft260_remove(struct hid_device *hdev)
 		return;
 
 	if (dev->iface_type == FT260_IFACE_UART) {
+		if (dev->gpio_registered)
+			gpiochip_remove(dev->gc);
 		cancel_work_sync(&dev->wakeup_work);
 		tty_port_unregister_device(&dev->port, ft260_tty_driver,
 					   dev->index);
@@ -2728,6 +2739,19 @@ static void ft260_remove(struct hid_device *hdev)
 			 dev->chip_mode == FT260_MODE_BOTH)
 			sysfs_remove_group(&hdev->dev.kobj,
 					   &ft260_i2c_chip_mode_0_3_attr_group);
+		/*
+		 * Unregister the gpiochip before freeing dev.  With the devm
+		 * variant, gpiochip_remove() ran after this function returned,
+		 * i.e. after kfree(dev); any in-flight or new gpio callback
+		 * (ft260_gpio_set() and friends) then dereferenced the freed
+		 * struct ft260_device through gpiochip_get_data() -> KASAN
+		 * use-after-free on hot-unplug.  Removing it manually here
+		 * first makes gpiochip_remove()'s SRCU synchronisation wait
+		 * for outstanding gpio operations and stop new ones before we
+		 * release the private data.
+		 */
+		if (dev->gpio_registered)
+			gpiochip_remove(dev->gc);
 		i2c_del_adapter(&dev->adap);
 		kfree(dev);
 	}
